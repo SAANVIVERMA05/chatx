@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  # ── Postgres ─────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: chatx
+      POSTGRES_USER: chatx
+      POSTGRES_PASSWORD: chatx_secret
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chatx -d chatx"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── Express API + Socket.io ──────────────────────────────
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      PORT: "4000"
+      NODE_ENV: production
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: chatx
+      POSTGRES_USER: chatx
+      POSTGRES_PASSWORD: chatx_secret
+      JWT_SECRET: change-me-in-production
+      JWT_EXPIRES_IN: 7d
+      CORS_ORIGIN: http://localhost:3000
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Next.js Frontend ─────────────────────────────────────
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+      NEXT_PUBLIC_WS_URL: http://localhost:4000
+    depends_on:
+      - server
+
+volumes:
+  pgdata:

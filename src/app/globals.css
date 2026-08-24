@@ -18,6 +18,22 @@
   --font-mono: var(--font-geist-mono), monospace;
 }
 
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+[data-theme="light"] {
+  --color-background: #F8F9FA;
+  --color-sidebar: #FFFFFF;
+  --color-surface: #FFFFFF;
+  --color-elevated: #F1F3F5;
+  --color-border: #E2E5E9;
+  --color-text-primary: #1A1A1A;
+  --color-text-muted: #6B7280;
+  color-scheme: light;
+}
+
 :root {
   /* Set base styles to be dark-first */
   background-color: var(--color-background);
@@ -55,5 +71,67 @@ body {
   }
   &::-webkit-scrollbar-thumb:hover {
     background-color: var(--color-text-muted);
+  }
+}
+
+/* Typing indicator bouncing dots */
+.typing-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--color-text-muted);
+  animation: typingBounce 1.4s infinite ease-in-out both;
+}
+
+.typing-dot-sm {
+  display: inline-block;
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background-color: var(--color-primary);
+  animation: typingBounce 1.4s infinite ease-in-out both;
+}
+
+@keyframes typingBounce {
+  0%, 80%, 100% {
+    transform: scale(0.6);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Mobile responsive helpers */
+@media (max-width: 767px) {
+  /* Ensure touch targets are at least 44px */
+  button, a, [role="button"] {
+    min-height: 44px;
+  }
+
+  /* Prevent text size auto-adjust on iOS */
+  input, textarea, select {
+    font-size: 16px !important;
+  }
+
+  /* Smooth scroll for mobile */
+  .custom-scrollbar {
+    -webkit-overflow-scrolling: touch;
+    scroll-behavior: smooth;
+  }
+
+  /* Hide scrollbar on mobile for cleaner look */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 0;
+    display: none;
+  }
+}
+
+/* Desktop: show scrollbars */
+@media (min-width: 768px) {
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
   }
 }
