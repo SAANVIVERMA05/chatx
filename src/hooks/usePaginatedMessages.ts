@@ -14,18 +14,9 @@
 
 import { useState, useCallback, useRef } from "react";
 
-export interface PaginatedMessage {
-  id: string;
-  chatId: string;
-  senderId: string;
-  content: string;
-  timestamp: string;
-  status: string;
-  type: string;
-  file?: { name: string; size: string; url?: string };
-  sender?: { id: string; name: string; avatar?: string; status: string };
-  replyTo?: { id: string; content: string; senderName: string };
-}
+import type { Message } from "@/types/chat";
+
+export type PaginatedMessage = Message;
 
 interface UsePaginatedMessagesReturn {
   messages: Record<string, PaginatedMessage[]>;
@@ -47,6 +38,60 @@ interface UsePaginatedMessagesReturn {
 
 const PAGE_SIZE = 50;
 
+import { decryptChatMessage } from "@/lib/e2e";
+import { getActiveUserId } from "@/lib/keyStore";
+import { normalizeMessage } from "@/types/chat";
+
+async function decryptMessageArray(messages: any[], chatId: string): Promise<PaginatedMessage[]> {
+  const currentUserId = getActiveUserId();
+  const decryptedMessages = [];
+
+  // Messages from server are usually sorted by timestamp desc, but we want to process them chronologically (asc) to keep ratchet state in sync
+  const sorted = [...messages].sort((a, b) => new Date(a.timestamp || a.created_at).getTime() - new Date(b.timestamp || b.created_at).getTime());
+
+  for (const raw of sorted) {
+    const msg = normalizeMessage(raw);
+    
+    if (msg.ciphertext && !msg.ratchetHeader?.group) {
+      // E2E encrypted direct message
+      try {
+        if (msg.senderId === currentUserId) {
+          // We sent this message. In a real app we'd keep local plaintext or a sent-keys cache.
+          // For now, we'll try to decrypt it if we somehow saved the key, or just show fallback.
+          msg.plaintext = "💬 [You sent an encrypted message]";
+        } else {
+          msg.plaintext = await decryptChatMessage(
+            chatId,
+            msg.ciphertext,
+            msg.nonce,
+            msg.ratchetHeader
+          );
+        }
+      } catch (e) {
+        console.warn("Failed to decrypt message:", msg.id, e);
+        msg.plaintext = "🔒 [Encrypted Message]";
+      }
+    } else if (msg.ciphertext && msg.ratchetHeader?.group) {
+      // Dummy encryption for groups
+      try {
+        msg.plaintext = atob(msg.ciphertext);
+      } catch {
+        msg.plaintext = "Failed to decode group msg";
+      }
+    } else {
+      // Legacy plaintext message
+      msg.plaintext = msg.content || msg.plaintext;
+    }
+    
+    // UI expects content to have the text
+    msg.content = msg.plaintext || msg.ciphertext || "";
+    decryptedMessages.push(msg);
+  }
+
+  // Restore original sort order (descending timestamp for UI)
+  return decryptedMessages.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+}
+
 async function fetchPage(
   chatId: string,
   token: string,
@@ -60,7 +105,11 @@ async function fetchPage(
     headers: { Authorization: `Bearer ${token}` },
   });
   if (!res.ok) return { messages: [], hasMore: false };
-  return res.json();
+  
+  const data = await res.json();
+  const decrypted = await decryptMessageArray(data.messages, chatId);
+  
+  return { messages: decrypted, hasMore: data.hasMore };
 }
 
 export function usePaginatedMessages(): UsePaginatedMessagesReturn {
@@ -136,7 +185,7 @@ export function usePaginatedMessages(): UsePaginatedMessagesReturn {
       setMessages((prev) => ({
         ...prev,
         [chatId]: (prev[chatId] ?? []).map((m) =>
-          m.id === messageId ? { ...m, status } : m
+          m.id === messageId ? { ...m, status: status as Message["status"] } : m
         ),
       }));
     },
@@ -148,7 +197,7 @@ export function usePaginatedMessages(): UsePaginatedMessagesReturn {
       ...prev,
       [chatId]: (prev[chatId] ?? []).map((m) =>
         m.senderId !== myUserId && m.status !== "read"
-          ? { ...m, status: "read" }
+          ? { ...m, status: "read" as Message["status"] }
           : m
       ),
     }));

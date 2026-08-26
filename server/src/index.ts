@@ -23,6 +23,7 @@ import otpRoutes from "./routes/otp";
 import conversationRoutes from "./routes/conversations";
 import messageRoutes from "./routes/messages";
 import uploadRoutes from "./routes/uploads";
+import keysRoutes from "./routes/keys";
 import { setupSocketHandlers } from "./socket";
 
 const app = express();
@@ -74,6 +75,7 @@ app.use("/api/auth/legacy", authRoutes);      // Legacy password auth (deprecate
 app.use("/api/conversations", conversationRoutes);
 app.use("/api/messages", messageRoutes);
 app.use("/api/uploads", uploadRoutes);
+app.use("/api/keys", keysRoutes);
 
 // Static file serving for uploads
 app.use("/uploads", express.static("uploads"));

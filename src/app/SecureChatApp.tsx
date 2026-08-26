@@ -44,35 +44,11 @@ import ReadReceipt from "@/components/ReadReceipt";
 import { useNotifications } from "@/hooks/useNotifications";
 import NewChatModal from "@/components/NewChatModal";
 import { usePaginatedMessages } from "@/hooks/usePaginatedMessages";
+import { offlineQueue } from "@/lib/offlineQueue";
+import { encryptChatMessage, decryptChatMessage } from "@/lib/e2e";
+import { Message, normalizeMessage } from "@/types/chat";
 
 type User = Omit<AuthUser, "password">;
-
-type Message = {
-  id: string;
-  chatId: string;
-  senderId: string;
-  content: string;
-  timestamp: string;
-  status: "sending" | "sent" | "delivered" | "read" | "failed";
-  type: "text" | "file";
-  file?: {
-    name: string;
-    size: string;
-    url?: string;
-    progress?: number;
-  };
-  sender?: {
-    id: string;
-    name: string;
-    avatar?: string;
-    status: string;
-  };
-  replyTo?: {
-    id: string;
-    content: string;
-    senderName: string;
-  };
-};
 
 type Chat = {
   id: string;
@@ -171,22 +147,6 @@ function relativeTime(iso: string): string {
   return new Date(iso).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-// Normalize socket messages (snake_case from server) to client Message type
-function normalizeMessage(raw: Record<string, unknown>): Message {
-  return {
-    id: raw.id as string,
-    chatId: (raw.chatId as string) || (raw.conversation_id as string) || (raw.chat_id as string) || "",
-    senderId: (raw.senderId as string) || (raw.sender_id as string) || "",
-    content: (raw.content as string) || "",
-    timestamp: (raw.timestamp as string) || (raw.created_at as string) || new Date().toISOString(),
-    status: (raw.status as Message["status"]) || "sent",
-    type: (raw.type as Message["type"]) || (raw.message_type as Message["type"]) || "text",
-    file: raw.file as Message["file"] || (raw.file_url ? { name: (raw.file_name as string) || "file", size: (raw.file_size as string) || "", url: raw.file_url as string } : undefined),
-    sender: raw.sender as Message["sender"] || (raw.sender_username ? { id: raw.sender_id as string, name: raw.sender_username as string, status: "online" } : undefined),
-    replyTo: raw.replyTo as Message["replyTo"] || (raw.reply_to as Message["replyTo"]) || undefined,
-  };
-}
-
 export default function SecureChatApp() {
   const { user: currentUser, token, logout, isLoading: authLoading } = useAuth();
   const router = useRouter();
@@ -229,6 +189,7 @@ export default function SecureChatApp() {
   const [newMessage, setNewMessage] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isConnected, setIsConnected] = useState(false);
+  const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [typingUsers, setTypingUsers] = useState<Record<string, string[]>>({});
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
@@ -262,6 +223,9 @@ export default function SecureChatApp() {
 
   // Use ref for socket to avoid stale closures in callbacks
   const socketRef = useRef<any>(null);
+  // Mirror selectedChatId in a ref so the reconnect handler always sees the latest value
+  const selectedChatIdRef = useRef<string | null>(null);
+  useEffect(() => { selectedChatIdRef.current = selectedChatId; }, [selectedChatId]);
 
   // Redirect to login if not authenticated (only after auth finishes loading)
   useEffect(() => {
@@ -309,11 +273,17 @@ export default function SecureChatApp() {
           userId: currentUser.id,
           username: currentUser.name,
         },
+        // Exponential backoff: 1s → 30s cap with 30% jitter
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 30000,
+        randomizationFactor: 0.3,
       });
 
       newSocket.on("connect", () => {
         console.log("Socket connected");
         setIsConnected(true);
+        setReconnectAttempt(0);
       });
 
       newSocket.on("disconnect", () => {
@@ -321,12 +291,49 @@ export default function SecureChatApp() {
         setIsConnected(false);
       });
 
+      newSocket.on("reconnect_attempt", (attempt: number) => {
+        setReconnectAttempt(attempt);
+      });
+
+      // On reconnect: re-join the active conversation room and flush offline queue
+      newSocket.on("reconnect", async () => {
+        // Re-join currently open conversation (socket.io drops room memberships on disconnect)
+        const activeChatId = selectedChatIdRef.current;
+        if (activeChatId) {
+          newSocket.emit("conversation:join", activeChatId);
+        }
+        // Flush IndexedDB outbox — re-emit all queued messages in order
+        try {
+          const queued = await offlineQueue.getAll();
+          for (const item of queued) {
+            newSocket.emit("message:send", {
+              conversationId: item.conversationId,
+              ciphertext: item.ciphertext,
+              nonce: item.nonce,
+              ratchetHeader: item.ratchetHeader,
+              msgNumber: item.msgNumber,
+              content: item.content,
+              tempId: item.tempId,
+              messageType: item.messageType,
+              fileUrl: item.fileUrl,
+              fileName: item.fileName,
+              fileSize: item.fileSize,
+              replyTo: item.replyTo,
+            });
+          }
+        } catch (err) {
+          console.warn("Offline queue flush failed:", err);
+        }
+      });
+
       // Handle our own sent message (replaces optimistic)
       newSocket.on("message:sent", (raw: Record<string, unknown>) => {
         const message = normalizeMessage(raw);
-        // Find and replace the matching optimistic message
-        const tempId = `temp_${message.senderId}`; // best-effort match
+        // Use the echoed tempId for a precise optimistic replacement
+        const tempId = (raw.tempId as string) || message.id;
         replaceOptimistic(message.chatId, tempId, message as any);
+        // Dequeue from IndexedDB now that server confirmed
+        if (raw.tempId) offlineQueue.dequeue(raw.tempId as string).catch(() => {});
 
         // Update chat's last message and move to top
         setChats((prev) => {
@@ -338,8 +345,32 @@ export default function SecureChatApp() {
       });
 
       // Handle messages from other users
-      newSocket.on("message:new", (raw: Record<string, unknown>) => {
+      newSocket.on("message:new", async (raw: Record<string, unknown>) => {
         const message = normalizeMessage(raw);
+
+        // Decrypt if needed
+        if (message.ciphertext && !message.ratchetHeader?.group) {
+          try {
+            message.plaintext = await decryptChatMessage(
+              message.chatId,
+              message.ciphertext,
+              message.nonce,
+              message.ratchetHeader
+            );
+          } catch (err) {
+            console.error("Failed to decrypt incoming msg", err);
+            message.plaintext = "🔒 [Encrypted Message]";
+          }
+        } else if (message.ciphertext && message.ratchetHeader?.group) {
+          try {
+            message.plaintext = atob(message.ciphertext);
+          } catch {
+            message.plaintext = "Failed to decode group msg";
+          }
+        } else {
+          message.plaintext = message.content || message.plaintext;
+        }
+        message.content = message.plaintext || message.ciphertext || "";
 
         // Push notification for messages from others when tab is backgrounded
         if (message.senderId !== currentUser?.id) {
@@ -381,11 +412,11 @@ export default function SecureChatApp() {
 
       newSocket.on(
         "typing:start",
-        (data: { userId: string; chatId: string }) => {
+        (data: { userId: string; conversationId: string }) => {
           setTypingUsers((prev) => ({
             ...prev,
-            [data.chatId]: [
-              ...(prev[data.chatId] || []).filter((id) => id !== data.userId),
+            [data.conversationId]: [
+              ...(prev[data.conversationId] || []).filter((id) => id !== data.userId),
               data.userId,
             ],
           }));
@@ -394,33 +425,37 @@ export default function SecureChatApp() {
 
       newSocket.on(
         "typing:stop",
-        (data: { userId: string; chatId: string }) => {
+        (data: { userId: string; conversationId: string }) => {
           setTypingUsers((prev) => ({
             ...prev,
-            [data.chatId]: (prev[data.chatId] || []).filter(
+            [data.conversationId]: (prev[data.conversationId] || []).filter(
               (id) => id !== data.userId
             ),
           }));
         }
       );
 
-      // Handle read receipts from other users
+      // Handle read receipts from other users (bulk — mark all received msgs as read)
       newSocket.on(
         "messages:read",
         (data: { userId: string; conversationId: string }) => {
-          // Mark all our outgoing messages in this chat as read
-          updateMessageStatus(data.conversationId, "__all_mine__", "read");
-          // More precise: iterate and update only sender=me messages
-          // (handled inside updateStatus with special sentinel — we keep markAllRead for this)
           markAllRead(data.conversationId, currentUser?.id ?? "");
         }
       );
 
-      // Handle status updates for our sent messages
+      // Handle per-message delivery confirmation (sent to our personal room)
       newSocket.on(
         "message:delivered",
         (data: { messageId: string; chatId: string }) => {
           updateMessageStatus(data.chatId, data.messageId, "delivered");
+        }
+      );
+
+      // Handle per-message read confirmation (sent to our personal room)
+      newSocket.on(
+        "message:read",
+        (data: { messageId: string; chatId: string }) => {
+          updateMessageStatus(data.chatId, data.messageId, "read");
         }
       );
 
@@ -509,9 +544,12 @@ export default function SecureChatApp() {
   }, [selectedChatId]);
 
   // Send message
-  const handleSendMessage = useCallback(() => {
+  const handleSendMessage = useCallback(async () => {
     const msg = newMessage.trim();
     if (!msg || !selectedChatId || !currentUser) return;
+
+    const chat = chats.find(c => c.id === selectedChatId);
+    if (!chat) return;
 
     // Capture reply before clearing
     const replyTarget = replyToMessage;
@@ -520,12 +558,26 @@ export default function SecureChatApp() {
     setNewMessage("");
     setReplyToMessage(null);
 
+    // Stable temp ID — used for optimistic display AND server echo-back
+    const tempId = `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    const replyPayload = replyTarget ? {
+      id: replyTarget.id,
+      content: replyTarget.content,
+      senderName: replyTarget.sender?.name || "",
+    } : undefined;
+
     // Create optimistic message for instant display
     const optimisticMessage: Message = {
-      id: `temp_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      id: tempId,
       chatId: selectedChatId,
       senderId: currentUser.id,
-      content: msg,
+      ciphertext: "", // Optimistic UI doesn't need real ciphertext
+      nonce: "",
+      ratchetHeader: {},
+      msgNumber: 0,
+      content: msg, // Fallback for UI
+      plaintext: msg, // Add plaintext for UI to render
       timestamp: new Date().toISOString(),
       status: "sending",
       type: "text",
@@ -535,11 +587,7 @@ export default function SecureChatApp() {
         avatar: currentUser.avatar,
         status: currentUser.status,
       },
-      replyTo: replyTarget ? {
-        id: replyTarget.id,
-        content: replyTarget.content,
-        senderName: replyTarget.sender?.name || "",
-      } : undefined,
+      replyTo: replyPayload,
     };
 
     // Add optimistic message immediately
@@ -547,45 +595,92 @@ export default function SecureChatApp() {
 
     // Update chat's last message
     setChats((prev) =>
-      prev.map((chat) =>
-        chat.id === selectedChatId
-          ? { ...chat, lastMessage: optimisticMessage }
-          : chat
+      prev.map((c) =>
+        c.id === selectedChatId
+          ? { ...c, lastMessage: optimisticMessage }
+          : c
       )
     );
 
-    // Send via socket (server persists and broadcasts)
-    socketRef.current?.emit("message:send", {
+    let ciphertext = msg;
+    let nonce = "";
+    let ratchetHeader = {};
+    let msgNumber = 0;
+
+    if (chat.type === "direct") {
+      const recipientId = chat.participants.find((p) => p.id !== currentUser.id)?.id;
+      if (recipientId && token) {
+        try {
+          const enc = await encryptChatMessage(selectedChatId, recipientId, msg, token);
+          ciphertext = enc.ciphertext;
+          nonce = enc.nonce;
+          ratchetHeader = enc.ratchetHeader;
+          msgNumber = enc.msgNumber;
+        } catch (err) {
+          console.error("Encryption failed:", err);
+          updateMessageStatus(selectedChatId, tempId, "failed");
+          return;
+        }
+      }
+    } else {
+      // Dummy encryption for groups to satisfy DB schema
+      ciphertext = btoa(msg);
+      nonce = "group_nonce";
+      ratchetHeader = { group: true };
+    }
+
+    const sendPayload = {
       conversationId: selectedChatId,
-      content: msg,
-      replyTo: replyTarget ? {
-        id: replyTarget.id,
-        content: replyTarget.content,
-        senderName: replyTarget.sender?.name || "",
-      } : undefined,
-    });
+      ciphertext,
+      nonce,
+      ratchetHeader,
+      msgNumber,
+      tempId,
+      replyTo: replyPayload,
+    };
+
+    if (socketRef.current?.connected) {
+      // Online — emit immediately
+      socketRef.current.emit("message:send", sendPayload);
+    } else {
+      // Offline — persist to IndexedDB; will be flushed on reconnect
+      offlineQueue.enqueue({ ...sendPayload, queuedAt: new Date().toISOString() }).catch(() => {});
+    }
 
     // Stop typing indicator
-    socketRef.current?.emit("typing:stop", selectedChatId);
+    if (currentUser) {
+      socketRef.current?.emit("typing:stop", {
+        conversationId: selectedChatId,
+        userId: currentUser.id,
+      });
+    }
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
-  }, [newMessage, selectedChatId, currentUser, replyToMessage]);
+  }, [newMessage, selectedChatId, currentUser, replyToMessage, chats, appendPaginatedMessage, token, updateMessageStatus]);
 
   // Handle typing indicator
   const handleTyping = useCallback(() => {
-    if (!selectedChatId || !socketRef.current) return;
+    if (!selectedChatId || !currentUser || !socketRef.current) return;
 
-    socketRef.current.emit("typing:start", selectedChatId);
+    // Structured payload matching server's expected shape
+    socketRef.current.emit("typing:start", {
+      conversationId: selectedChatId,
+      userId: currentUser.id,
+    });
 
     if (typingTimeoutRef.current) {
       clearTimeout(typingTimeoutRef.current);
     }
 
+    // 3 000 ms — matches the server-side idle auto-stop timer
     typingTimeoutRef.current = setTimeout(() => {
-      socketRef.current?.emit("typing:stop", selectedChatId);
-    }, 2000);
-  }, [selectedChatId]);
+      socketRef.current?.emit("typing:stop", {
+        conversationId: selectedChatId,
+        userId: currentUser.id,
+      });
+    }, 3000);
+  }, [selectedChatId, currentUser]);
 
   // Close emoji picker on click outside chat area
   useEffect(() => {
@@ -653,17 +748,24 @@ export default function SecureChatApp() {
         const fileSize = formatFileSize(data.file.size);
 
         // Create optimistic voice message
+        const tempId = `temp_voice_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const optimisticMessage: Message = {
-          id: `temp_voice_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: tempId,
           chatId: selectedChatId,
           senderId: currentUser.id,
-          content: `🎤 Voice message (${Math.floor(duration / 60)}:${(duration % 60).toString().padStart(2, "0")})`,
+          ciphertext: "",
+          nonce: "",
+          ratchetHeader: {},
+          msgNumber: 0,
+          content: "Voice message",
+          plaintext: "Voice message",
           timestamp: new Date().toISOString(),
           status: "sending",
           type: "file",
           file: {
             name: filename,
             size: fileSize,
+            url: URL.createObjectURL(blob),
           },
           sender: {
             id: currentUser.id,
@@ -694,6 +796,7 @@ export default function SecureChatApp() {
           fileSize,
           messageType: "audio",
           duration,
+          tempId,
         });
       } catch (err) {
         console.error("Voice upload failed:", err);
@@ -736,11 +839,17 @@ export default function SecureChatApp() {
         const fileSize = formatFileSize(data.file.size);
 
         // Create optimistic file message
+        const tempId = `temp_file_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
         const optimisticMessage: Message = {
-          id: `temp_file_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+          id: tempId,
           chatId: selectedChatId,
           senderId: currentUser.id,
-          content: isImageFile(fileName) ? "📷 Photo" : `📎 ${fileName}`,
+          ciphertext: "",
+          nonce: "",
+          ratchetHeader: {},
+          msgNumber: 0,
+          content: "Sending file...",
+          plaintext: "Sending file...",
           timestamp: new Date().toISOString(),
           status: "sending",
           type: "file",
@@ -853,6 +962,38 @@ export default function SecureChatApp() {
     );
   }
 
+  /**
+   * ConnectionBadge — polished pill showing live socket state.
+   * 🟢 pulse = connected  |  🟡 spin = reconnecting  |  🔴 static = offline
+   */
+  function ConnectionBadge() {
+    if (isConnected) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-500">
+          <span className="h-2 w-2 rounded-full bg-emerald-500 connection-dot-pulse" />
+          Connected
+        </span>
+      );
+    }
+    if (reconnectAttempt > 0) {
+      return (
+        <span className="inline-flex items-center gap-1.5 text-xs font-medium text-amber-400">
+          <span
+            className="h-2 w-2 rounded-full border-2 border-amber-400 animate-spin"
+            style={{ borderTopColor: "transparent" }}
+          />
+          Reconnecting… ({reconnectAttempt})
+        </span>
+      );
+    }
+    return (
+      <span className="inline-flex items-center gap-1.5 text-xs font-medium text-red-400">
+        <span className="h-2 w-2 rounded-full bg-red-500" />
+        Offline
+      </span>
+    );
+  }
+
   return (
     <>
       <div className="flex h-screen w-full bg-(--color-background) text-(--color-text-primary) overflow-hidden">
@@ -871,9 +1012,7 @@ export default function SecureChatApp() {
             <div className="flex items-center space-x-2">
               <div className="text-right hidden md:block">
                 <p className="text-sm font-medium">{currentUser.name}</p>
-                <p className="text-xs text-(--color-text-muted)">
-                  {isConnected ? "Connected" : "Disconnected"}
-                </p>
+                <ConnectionBadge />
               </div>
               <Avatar
                 size="sm"

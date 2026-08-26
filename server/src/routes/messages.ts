@@ -49,10 +49,10 @@ router.post("/:conversationId", async (req: Request, res: Response) => {
   try {
     const { userId } = req as AuthRequest;
     const conversationId = req.params.conversationId as string;
-    const { content } = req.body;
+    const { ciphertext, nonce, ratchetHeader, msgNumber } = req.body;
 
-    if (!content?.trim()) {
-      return res.status(400).json({ error: "Content is required" });
+    if (!ciphertext || !nonce || !ratchetHeader) {
+      return res.status(400).json({ error: "E2E fields required" });
     }
 
     if (!(await convRepo.isMember(conversationId, userId))) {
@@ -62,7 +62,10 @@ router.post("/:conversationId", async (req: Request, res: Response) => {
     const message = await messageRepo.insert({
       conversationId,
       senderId: userId,
-      content: content.trim(),
+      ciphertext,
+      nonce,
+      ratchetHeader,
+      msgNumber: typeof msgNumber === 'number' ? msgNumber : 0,
     });
 
     res.status(201).json({ message });

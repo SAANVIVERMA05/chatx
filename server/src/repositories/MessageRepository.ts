@@ -15,7 +15,10 @@ export interface DbMessage {
   sender_id: string;
   sender_username: string;
   sender_avatar_url?: string;
-  content: string;
+  ciphertext: string;
+  nonce: string;
+  ratchet_header: Record<string, unknown>;
+  msg_number: number;
   message_type: "text" | "file" | "image" | "video";
   file_url: string | null;
   file_name: string | null;
@@ -28,7 +31,10 @@ export interface DbMessage {
 export interface InsertMessageParams {
   conversationId: string;
   senderId: string;
-  content: string;
+  ciphertext: string;
+  nonce: string;
+  ratchetHeader: Record<string, unknown>;
+  msgNumber: number;
   messageType?: string;
   fileUrl?: string | null;
   fileName?: string | null;
@@ -44,14 +50,17 @@ export class MessageRepository {
   async insert(params: InsertMessageParams): Promise<DbMessage> {
     const result = await this.pool.query<DbMessage>(
       `INSERT INTO messages
-         (conversation_id, sender_id, content, message_type, file_url, file_name, file_size)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id, conversation_id, sender_id, content, created_at,
+         (conversation_id, sender_id, ciphertext, nonce, ratchet_header, msg_number, message_type, file_url, file_name, file_size)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       RETURNING id, conversation_id, sender_id, ciphertext, nonce, ratchet_header, msg_number, created_at,
                  delivered_at, read_at, message_type, file_url, file_name, file_size`,
       [
         params.conversationId,
         params.senderId,
-        params.content?.trim() || "",
+        params.ciphertext,
+        params.nonce,
+        params.ratchetHeader,
+        params.msgNumber,
         params.messageType || "text",
         params.fileUrl ?? null,
         params.fileName ?? null,
@@ -75,7 +84,7 @@ export class MessageRepository {
         m.id, m.conversation_id, m.sender_id,
         u.username AS sender_username,
         u.avatar_url AS sender_avatar_url,
-        m.content, m.created_at, m.delivered_at, m.read_at,
+        m.ciphertext, m.nonce, m.ratchet_header, m.msg_number, m.created_at, m.delivered_at, m.read_at,
         m.message_type, m.file_url, m.file_name, m.file_size
       FROM messages m
       JOIN users u ON u.id = m.sender_id
@@ -96,15 +105,67 @@ export class MessageRepository {
 
   /**
    * Mark all unread messages in a conversation (not sent by the given user) as read.
+   * Returns the id and sender_id of each newly-read message so the caller can
+   * fan-out individual { type:"read", msgId } events to sender personal rooms.
    */
-  async markRead(conversationId: string, readerUserId: string): Promise<void> {
-    await this.pool.query(
+  async markRead(
+    conversationId: string,
+    readerUserId: string
+  ): Promise<Array<{ id: string; sender_id: string }>> {
+    const result = await this.pool.query<{ id: string; sender_id: string }>(
       `UPDATE messages
        SET read_at = now()
        WHERE conversation_id = $1
          AND sender_id != $2
-         AND read_at IS NULL`,
+         AND read_at IS NULL
+       RETURNING id, sender_id`,
       [conversationId, readerUserId]
     );
+    return result.rows;
+  }
+
+  /**
+   * Mark all un-delivered messages in a conversation (not sent by the given user)
+   * as delivered. Returns the id and sender_id of each newly-delivered message so
+   * the caller can fan-out individual { type:"delivered", msgId } events.
+   */
+  async markDelivered(
+    conversationId: string,
+    viewerUserId: string
+  ): Promise<Array<{ id: string; sender_id: string }>> {
+    const result = await this.pool.query<{ id: string; sender_id: string }>(
+      `UPDATE messages
+       SET delivered_at = now()
+       WHERE conversation_id = $1
+         AND sender_id != $2
+         AND delivered_at IS NULL
+       RETURNING id, sender_id`,
+      [conversationId, viewerUserId]
+    );
+    return result.rows;
+  }
+  /**
+   * Find all un-delivered messages across every conversation the given user
+   * is a member of (excluding messages they sent themselves).
+   * Used on socket reconnect to fan-out any pending delivery notifications.
+   */
+  async getPendingDelivered(
+    userId: string
+  ): Promise<Array<{ id: string; sender_id: string; conversation_id: string }>> {
+    const result = await this.pool.query<{
+      id: string;
+      sender_id: string;
+      conversation_id: string;
+    }>(
+      `SELECT m.id, m.sender_id, m.conversation_id
+       FROM messages m
+       JOIN conversation_members cm
+         ON cm.conversation_id = m.conversation_id
+        AND cm.user_id = $1
+       WHERE m.sender_id != $1
+         AND m.delivered_at IS NULL`,
+      [userId]
+    );
+    return result.rows;
   }
 }

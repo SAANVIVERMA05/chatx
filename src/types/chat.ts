@@ -38,13 +38,19 @@ export interface Message {
   id: string;
   chatId: string;
   senderId: string;
-  content: string;
+  ciphertext: string;
+  nonce: string;
+  ratchetHeader: Record<string, unknown>;
+  msgNumber: number;
   timestamp: string;
   status: MessageStatus;
   type: MessageType;
   file?: MessageFile;
   sender?: ChatUser;
   replyTo?: ReplyTo;
+  // plaintext is populated on the client side after decryption
+  plaintext?: string;
+  content?: string;
 }
 
 export interface Chat {
@@ -71,7 +77,11 @@ export function normalizeMessage(raw: Record<string, unknown>): Message {
       (raw.chat_id as string) ||
       "",
     senderId: (raw.senderId as string) || (raw.sender_id as string) || "",
-    content: (raw.content as string) || "",
+    ciphertext: (raw.ciphertext as string) || "",
+    nonce: (raw.nonce as string) || "",
+    ratchetHeader: (raw.ratchetHeader as Record<string, unknown>) || (raw.ratchet_header as Record<string, unknown>) || {},
+    msgNumber: (raw.msgNumber as number) || (raw.msg_number as number) || 0,
+    plaintext: (raw.plaintext as string) || undefined,
     timestamp:
       (raw.timestamp as string) ||
       (raw.created_at as string) ||

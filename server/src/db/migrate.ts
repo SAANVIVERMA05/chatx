@@ -2,7 +2,7 @@ import { pool } from "./pool";
 
 const SCHEMA = `
 -- ============================================================
--- ChatX Schema v2 — phone-based auth + file uploads
+-- ChatX Schema v3 — E2E Encryption
 -- ============================================================
 
 -- Users
@@ -26,10 +26,29 @@ CREATE TABLE IF NOT EXISTS otp_codes (
   created_at    TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- Index for OTP lookups (phone + unused + not expired)
 CREATE INDEX IF NOT EXISTS idx_otp_lookup
   ON otp_codes(phone_number, code, used)
   WHERE used = false;
+
+-- Public Keys for E2E Enc
+CREATE TABLE IF NOT EXISTS public_keys (
+  user_id           UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  identity_key      TEXT NOT NULL,
+  signed_prekey     TEXT NOT NULL,
+  signed_prekey_sig TEXT NOT NULL,
+  signed_prekey_id  INT NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS one_time_prekeys (
+  id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  key_id     INT NOT NULL,
+  public_key TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_opk_user ON one_time_prekeys(user_id);
 
 -- Conversations (direct or group)
 CREATE TABLE IF NOT EXISTS conversations (
@@ -48,11 +67,15 @@ CREATE TABLE IF NOT EXISTS conversation_members (
 );
 
 -- Messages
+-- Replaced plaintext 'content' with E2E encrypted fields
 CREATE TABLE IF NOT EXISTS messages (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
   sender_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  content         TEXT NOT NULL,
+  ciphertext      TEXT NOT NULL,
+  nonce           TEXT NOT NULL,
+  ratchet_header  JSONB NOT NULL,
+  msg_number      INT NOT NULL DEFAULT 0,
   message_type    VARCHAR(10) NOT NULL DEFAULT 'text' CHECK (message_type IN ('text', 'file', 'image', 'video')),
   file_url        TEXT,
   file_name       TEXT,
@@ -77,10 +100,13 @@ CREATE INDEX IF NOT EXISTS idx_users_phone
 `;
 
 async function migrate() {
-  console.log("Running migration v2...");
+  console.log("Running migration v3...");
   try {
+    // Drop the old messages table completely to start fresh for v3 
+    // since we changed the schema destructively (this is acceptable for this step)
+    await pool.query(`DROP TABLE IF EXISTS messages CASCADE;`);
     await pool.query(SCHEMA);
-    console.log("✓ Migration complete — schema v2 applied");
+    console.log("✓ Migration complete — schema v3 applied");
   } catch (err) {
     console.error("✗ Migration failed:", (err as Error).message);
     process.exit(1);

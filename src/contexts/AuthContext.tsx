@@ -20,6 +20,7 @@ import {
   useEffect,
   ReactNode,
 } from "react";
+import { lockVault } from "@/lib/keyInit";
 
 export type AuthUser = {
   id: string;
@@ -153,6 +154,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }
 
   function logout(): void {
+    lockVault(); // Zero in-memory master key before clearing session
     clearSession();
   }
 

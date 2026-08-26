@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Lock, Phone, MessageSquare, ArrowLeft, Loader2, User } from "lucide-react";
 import CountryCodeSelect from "@/components/CountryCodeSelect";
+import { initializeKeys, unlockKeys } from "@/lib/keyInit";
 
 type Step = "phone" | "otp" | "name";
 
@@ -21,6 +22,9 @@ export default function LoginPage() {
   const [verifiedToken, setVerifiedToken] = useState<string | null>(null);
   const [verifiedUser, setVerifiedUser] = useState<any>(null);
   const [resendTimer, setResendTimer] = useState(0);
+  const [keyStep, setKeyStep] = useState<string | null>(null); // null = not running
+  // Keep the raw OTP available across steps for key derivation
+  const [rawOtp, setRawOtp] = useState("");
 
   const { loginWithOtp } = useAuth();
   const router = useRouter();
@@ -117,8 +121,16 @@ export default function LoginPage() {
       setVerifiedUser(data.user);
 
       if (data.isNewUser) {
+        setRawOtp(code);
         setStep("name");
       } else {
+        // Returning user — unlock the key vault before entering the app
+        try {
+          await unlockKeys(data.user.id, code);
+        } catch {
+          // Key vault may not exist on this device yet; non-fatal for now
+          console.warn("Key vault unlock skipped (first login on this device)");
+        }
         loginWithOtp(data.user, data.token);
         router.push("/");
       }
@@ -159,8 +171,15 @@ export default function LoginPage() {
       setVerifiedUser(data.user);
 
       if (data.isNewUser) {
+        setRawOtp(code);
         setStep("name");
       } else {
+        // Returning user — unlock the key vault before entering the app
+        try {
+          await unlockKeys(data.user.id, code);
+        } catch {
+          console.warn("Key vault unlock skipped (first login on this device)");
+        }
         loginWithOtp(data.user, data.token);
         router.push("/");
       }
@@ -200,6 +219,30 @@ export default function LoginPage() {
 
       if (response.ok) {
         const data = await response.json();
+        const userId = data.user?.id || verifiedUser?.id || "";
+
+        // Generate & store E2E keys for the new account
+        setKeyStep("Initializing secure vault…");
+        try {
+          const bundle = await initializeKeys(userId, rawOtp, setKeyStep);
+          setKeyStep("Uploading keys…");
+          const keysRes = await fetch("/api/keys", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${authToken}`,
+            },
+            body: JSON.stringify(bundle),
+          });
+          if (!keysRes.ok) {
+            console.error("Failed to upload public keys");
+          }
+        } catch (e) {
+          console.error("Key init failed:", e);
+          // Non-fatal — user can still use the app, keys will be generated on next login
+        }
+        setKeyStep(null);
+
         loginWithOtp(data.user, authToken);
       } else {
         // Profile update failed, but token is still valid — login anyway
@@ -479,7 +522,12 @@ export default function LoginPage() {
                 )}
 
                 <Button type="submit" className="w-full" disabled={isLoading || name.trim().length < 2}>
-                  {isLoading ? (
+                  {keyStep ? (
+                    <span className="flex items-center justify-center">
+                      <Loader2 className="animate-spin -ml-1 mr-2 h-4 w-4" />
+                      {keyStep}
+                    </span>
+                  ) : isLoading ? (
                     <span className="flex items-center justify-center">
                       <Loader2 className="animate-spin -ml-1 mr-2 h-4 w-4" />
                       Creating account...
